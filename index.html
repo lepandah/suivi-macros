@@ -342,7 +342,32 @@
     <p class="hint">Repères « calories par pas » : ≈ 0,03 (~55 kg) · 0,04 (~70 kg) · 0,05 (~90 kg), ou poids (kg) × 0,0005. Repères séances : muscu ≈ 250–400 kcal, run ≈ 60–80 kcal par km (ex. 5 km ≈ 350 kcal).</p>
   </div>
   <div class="panel">
-    <h2>💾 Sauvegarde</h2>
+    <h2>☁️ Synchronisation cloud</h2>
+    <p class="hint" style="margin-bottom:12px">Synchronise tes données entre tous tes appareils (PC + téléphone) via un coffre privé GitHub. Ton jeton reste <b>uniquement sur cet appareil</b>, jamais dans le code en ligne.</p>
+    <div class="row">
+      <input type="password" id="syncToken" placeholder="Jeton GitHub (ghp_...)" style="flex:2;min-width:220px">
+      <button id="syncConnectBtn" onclick="syncConnect()">Connecter</button>
+    </div>
+    <div id="syncStatus" class="hint" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:12px">
+      <label style="display:flex;align-items:center;gap:8px;color:var(--txt);font-size:.9rem"><input type="checkbox" id="syncAuto" style="width:auto" onchange="toggleAutoSync()"> Synchroniser automatiquement</label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <button class="ghost" onclick="syncPull(true)">⬇️ Récupérer du cloud</button>
+      <button class="ghost" onclick="syncPush(true)">⬆️ Envoyer vers le cloud</button>
+      <button class="ghost" onclick="syncDisconnect()">Déconnecter</button>
+    </div>
+    <details style="margin-top:14px">
+      <summary class="hint" style="cursor:pointer">❓ Comment créer mon jeton GitHub (1 fois)</summary>
+      <p class="hint" style="margin-top:8px">1. Va sur <a href="https://github.com/settings/tokens/new" target="_blank">github.com/settings/tokens/new</a> (jeton classique).<br>
+      2. Nom : <b>suivi-macros</b> · Expiration : au choix (ex. 1 an).<br>
+      3. Coche <b>uniquement</b> la case <b>gist</b>.<br>
+      4. Clique <b>Generate token</b>, copie le <code>ghp_...</code> et colle-le ci-dessus, puis <b>Connecter</b>.<br>
+      5. Sur ton téléphone : ouvre l'app, colle <b>le même jeton</b>, Connecter. C'est tout — il retrouve ton coffre tout seul.</p>
+    </details>
+  </div>
+  <div class="panel">
+    <h2>💾 Sauvegarde manuelle (hors-ligne)</h2>
     <p class="hint" style="margin-bottom:12px">Exporte tes données (repas, pas, aliments, réglages) ou réimporte-les sur un autre ordinateur.</p>
     <div class="row">
       <button class="ghost" onclick="exportData()">Exporter mes données</button>
@@ -359,11 +384,15 @@ const DB = {
   log:   JSON.parse(localStorage.getItem('mt_log')   || '{}'),
   weights: JSON.parse(localStorage.getItem('mt_weights') || '{}'),
   settings: JSON.parse(localStorage.getItem('mt_settings') || '{"kps":0.04,"target":2150,"tProt":167,"tCarb":220,"tFat":65,"tFib":35,"kcalMuscu":300,"kcalRun":400,"sex":"h","age":null,"height":null,"weight":null,"neat":1.2}'),
-  save(){
+  updatedAt: +localStorage.getItem('mt_updatedAt') || 0,
+  save(bump=true){
+    if(bump){ this.updatedAt=Date.now(); }
+    localStorage.setItem('mt_updatedAt', this.updatedAt);
     localStorage.setItem('mt_foods', JSON.stringify(this.foods));
     localStorage.setItem('mt_log',   JSON.stringify(this.log));
     localStorage.setItem('mt_weights', JSON.stringify(this.weights));
     localStorage.setItem('mt_settings', JSON.stringify(this.settings));
+    if(bump) scheduleAutoPush();
   }
 };
 
@@ -885,6 +914,110 @@ function renderSuggestions(){
   });
 }
 
+/* ============ Synchronisation cloud (Gist GitHub) ============ */
+const GIST_FILE='suivi-macros-data.json';
+const getToken  = ()=>localStorage.getItem('mt_synctoken')||'';
+const getGistId = ()=>localStorage.getItem('mt_gistid')||'';
+const autoSyncOn= ()=>localStorage.getItem('mt_syncauto')==='1';
+let pushTimer=null;
+function setSyncStatus(msg,kind){
+  const el=document.getElementById('syncStatus'); if(!el) return;
+  el.innerHTML=msg; el.style.color = kind==='err'?'var(--danger)':(kind==='ok'?'var(--accent)':'var(--muted)');
+}
+function ghHeaders(token){ return {Authorization:'token '+token, Accept:'application/vnd.github+json'}; }
+
+async function syncConnect(){
+  const token=document.getElementById('syncToken').value.trim();
+  if(!token){ setSyncStatus('Colle ton jeton GitHub d\'abord.','err'); return; }
+  setSyncStatus('Connexion…');
+  try{
+    const res=await fetch('https://api.github.com/gists?per_page=100',{headers:ghHeaders(token)});
+    if(!res.ok) throw new Error('jeton invalide ou sans portée « gist » (HTTP '+res.status+')');
+    const list=await res.json();
+    let gid=null;
+    for(const g of list){ if(g.files && g.files[GIST_FILE]){ gid=g.id; break; } }
+    if(!gid){
+      const cr=await fetch('https://api.github.com/gists',{method:'POST',headers:ghHeaders(token),
+        body:JSON.stringify({description:'Suivi Macros - donnees synchronisees (ne pas supprimer)',public:false,
+          files:{[GIST_FILE]:{content:JSON.stringify({app:'suivi-macros',updatedAt:0,foods:[],log:{},weights:{},settings:{}})}}})});
+      if(!cr.ok) throw new Error('création du coffre impossible (HTTP '+cr.status+')');
+      gid=(await cr.json()).id;
+    }
+    localStorage.setItem('mt_synctoken',token);
+    localStorage.setItem('mt_gistid',gid);
+    localStorage.setItem('mt_syncauto','1');
+    document.getElementById('syncAuto').checked=true;
+    document.getElementById('syncToken').value='';
+    setSyncStatus('✓ Connecté. Synchronisation…','ok');
+    await syncPull(false);          // le cloud gagne s'il est plus récent
+    if((DB.updatedAt||0)>0) await syncPush(false); // sinon on envoie le local
+    updateSyncUI();
+  }catch(e){ setSyncStatus('Erreur : '+e.message,'err'); }
+}
+
+async function syncPush(manual){
+  const token=getToken(), gid=getGistId();
+  if(!token||!gid){ if(manual) setSyncStatus('Connecte-toi d\'abord.','err'); return; }
+  if(manual) setSyncStatus('Envoi…');
+  if(!DB.updatedAt){ DB.updatedAt=Date.now(); localStorage.setItem('mt_updatedAt',DB.updatedAt); }
+  const payload={app:'suivi-macros',updatedAt:DB.updatedAt,foods:DB.foods,log:DB.log,weights:DB.weights,settings:DB.settings};
+  try{
+    const res=await fetch('https://api.github.com/gists/'+gid,{method:'PATCH',headers:ghHeaders(token),
+      body:JSON.stringify({files:{[GIST_FILE]:{content:JSON.stringify(payload)}}})});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    setSyncStatus('✓ Sauvegardé dans le cloud · '+new Date().toLocaleTimeString(),'ok');
+  }catch(e){ setSyncStatus('Erreur d\'envoi : '+e.message,'err'); }
+}
+
+async function syncPull(manual){
+  const token=getToken(), gid=getGistId();
+  if(!token||!gid){ if(manual) setSyncStatus('Connecte-toi d\'abord.','err'); return; }
+  if(manual) setSyncStatus('Récupération…');
+  try{
+    const res=await fetch('https://api.github.com/gists/'+gid+'?_='+Date.now(),{headers:ghHeaders(token),cache:'no-store'});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const g=await res.json();
+    const f=g.files&&g.files[GIST_FILE]; if(!f) throw new Error('coffre vide');
+    let content=f.content;
+    if(f.truncated && f.raw_url){ content=await (await fetch(f.raw_url)).text(); }
+    const d=JSON.parse(content);
+    if(!manual && (d.updatedAt||0) <= (DB.updatedAt||0)){
+      setSyncStatus('À jour (données locales plus récentes).','ok');
+      if(autoSyncOn() && (DB.updatedAt||0)>(d.updatedAt||0)) syncPush(false);
+      return;
+    }
+    if(d.foods)DB.foods=d.foods; if(d.log)DB.log=d.log; if(d.weights)DB.weights=d.weights; if(d.settings)DB.settings=d.settings;
+    DB.updatedAt=d.updatedAt||Date.now();
+    DB.save(false);
+    migrate(); loadSettings(); fillQuickSelects(); renderFoods(); renderJournal(); renderSuggestions();
+    setSyncStatus('✓ Données récupérées du cloud · '+new Date().toLocaleTimeString(),'ok');
+  }catch(e){ setSyncStatus('Erreur de récupération : '+e.message,'err'); }
+}
+
+function scheduleAutoPush(){
+  if(!autoSyncOn()||!getToken()||!getGistId()) return;
+  clearTimeout(pushTimer);
+  pushTimer=setTimeout(()=>syncPush(false), 2500);
+}
+function toggleAutoSync(){
+  localStorage.setItem('mt_syncauto', document.getElementById('syncAuto').checked?'1':'0');
+  if(autoSyncOn()) syncPush(false);
+}
+function syncDisconnect(){
+  if(!confirm('Déconnecter la synchro sur cet appareil ? (tes données restent en local et dans le cloud)')) return;
+  localStorage.removeItem('mt_synctoken'); localStorage.removeItem('mt_gistid'); localStorage.setItem('mt_syncauto','0');
+  updateSyncUI(); setSyncStatus('Déconnecté de cet appareil.');
+}
+function updateSyncUI(){
+  const connected=!!getToken()&&!!getGistId();
+  const btn=document.getElementById('syncConnectBtn');
+  const auto=document.getElementById('syncAuto');
+  if(auto) auto.checked=autoSyncOn();
+  if(btn) btn.textContent=connected?'Reconnecter':'Connecter';
+  if(connected) setSyncStatus('✓ Connecté · synchro '+(autoSyncOn()?'auto activée':'manuelle')+'.','ok');
+  else setSyncStatus('Non connecté. Colle ton jeton pour synchroniser.');
+}
+
 /* ============ Import / Export ============ */
 function exportData(){
   const blob=new Blob([JSON.stringify({foods:DB.foods,log:DB.log,weights:DB.weights,settings:DB.settings},null,2)],{type:'application/json'});
@@ -919,6 +1052,9 @@ if(_s.neat==null)  _s.neat=1.2;
 DB.save();
 document.getElementById('dayPicker').value=todayStr();
 loadSettings(); fillQuickSelects(); renderFoods(); renderJournal(); renderSuggestions();
+// Synchro cloud : état + récupération auto au démarrage
+updateSyncUI();
+if(getToken() && getGistId() && autoSyncOn()) syncPull(false);
 </script>
 </body>
 </html>
